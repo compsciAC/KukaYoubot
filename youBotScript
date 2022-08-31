@@ -1,0 +1,362 @@
+function sysCall_init()
+    corout=coroutine.create(coroutineMain)
+end
+
+function sysCall_sensing()
+    if coroutine.status(corout)~='dead' then
+        local ok,errorMsg=coroutine.resume(corout)
+        if errorMsg then
+            error(debug.traceback(corout,errorMsg),2)
+        end
+    end
+end
+
+function getConfig(handles)
+    local c={}
+    for i=1,#handles,1 do
+        c[i]=sim.getJointPosition(handles[i])
+    end
+    return c
+end
+
+openGripper=function()
+    sim.writeCustomDataBlock(gripper,'activity','open')
+    sim.wait(0.8)
+end
+
+closeGripper=function()
+    sim.writeCustomDataBlock(gripper,'activity','close')
+    sim.wait(0.8)
+end
+
+setGripperTargetMovingWithVehicle=function()
+    sim.setObjectParent(gripperTarget,vehicleReference,true)
+end
+
+setGripperTargetFixedToWorld=function()
+    sim.setObjectParent(gripperTarget,-1,true)
+end
+
+waitToReachVehicleTargetPositionAndOrientation=function()
+    repeat
+        sim.switchThread() -- don't waste your time waiting!
+        p1=sim.getObjectPosition(vehicleTarget,-1)
+        p2=sim.getObjectPosition(vehicleReference,-1)
+        p={p2[1]-p1[1],p2[2]-p1[2]}
+        pError=math.sqrt(p[1]*p[1]+p[2]*p[2])
+        oError=math.abs(sim.getObjectOrientation(vehicleReference,vehicleTarget)[3])
+    until (pError<0.01)and(oError<0.01*math.pi/180) 
+end
+
+getBoxAdjustedMatrixAndFacingAngle=function(boxHandle)
+    p2=sim.getObjectPosition(boxHandle,-1)
+    p1=sim.getObjectPosition(vehicleReference,-1)
+    p={p2[1]-p1[1],p2[2]-p1[2],p2[3]-p1[3]}
+    pl=math.sqrt(p[1]*p[1]+p[2]*p[2]+p[3]*p[3])
+    p[1]=p[1]/pl
+    p[2]=p[2]/pl
+    p[3]=p[3]/pl
+    m=sim.getObjectMatrix(boxHandle,-1)
+    matchingScore=0
+    for i=1,3,1 do
+        v={m[0+i],m[4+i],m[8+i]}
+        score=v[1]*p[1]+v[2]*p[2]+v[3]*p[3]
+        if (math.abs(score)>matchingScore) then
+            s=1
+            if (score<0) then s=-1 end
+            matchingScore=math.abs(score)
+            bestMatch={v[1]*s,v[2]*s,v[3]*s}
+        end
+    end
+    angle=math.atan2(bestMatch[2],bestMatch[1])
+    m=sim.buildMatrix(p2,{0,0,angle})
+    return m, angle-math.pi/2
+end
+
+pickupBoxFromPlace=function(boxHandle,pickupConf)
+    local m,angle=getBoxAdjustedMatrixAndFacingAngle(boxHandle)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickupConf,nil,fkcb,armJoints)
+    waitToReachVehicleTargetPositionAndOrientation()
+    setGripperTargetFixedToWorld()
+    local q=sim.getObjectPose(gripperTip,-1)
+    q[1]=m[4]
+    q[2]=m[8]
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    openGripper()
+    q[3]=m[12]
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    closeGripper()
+    q[3]=q[3]+0.1
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    setGripperTargetMovingWithVehicle()    
+end
+
+dropToPlatform=function(platform)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,{0.3,0.3,0.3,0.3,0.3},fkJerk,platform,nil,fkcb,armJoints)
+    openGripper()
+end
+
+dropToPlace=function(placeHandle,shift,verticalPos,startConf,noVerticalArmForUpMovement)
+    local m,angle=getBoxAdjustedMatrixAndFacingAngle(placeHandle)
+    m[4]=m[4]+m[2]*shift
+    m[8]=m[8]+m[6]*shift
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,startConf,nil,fkcb,armJoints)
+    
+    waitToReachVehicleTargetPositionAndOrientation()
+    setGripperTargetFixedToWorld()
+    local q=sim.getObjectPose(gripperTip,-1)
+    q[1]=m[4]
+    q[2]=m[8]
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    q[3]=verticalPos
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    openGripper()
+    q[3]=q[3]+0.1
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    setGripperTargetMovingWithVehicle()    
+end
+
+function ikcb1(q,vel,accel,data)
+    sim.setObjectPose(data.target,-1,q)
+    simIK.applyIkEnvironmentToScene(ikEnv,data.ikGroups[1])
+end
+
+function ikcb2(q,vel,accel,data)
+    sim.setObjectPose(data.target,-1,q)
+    simIK.applyIkEnvironmentToScene(ikEnv,data.ikGroups[2])
+end
+
+function fkcb(config,vel,accel,handles)
+    for i=1,#handles,1 do
+        sim.setJointTargetPosition(handles[i],config[i])
+    end
+end
+
+function coroutineMain()
+    local base=sim.getObjectHandle(sim.handle_self)
+    gripperTarget=sim.getObjectHandle('youBot_gripperPositionTarget')
+    gripperTip=sim.getObjectHandle('youBot_gripperPositionTip')
+    local base2=sim.getObjectHandle('Rectangle22')
+    local constrBase2=sim.getObjectHandle('youBot_gripperOrientationTarget')
+    local gripperTarget2=sim.getObjectHandle('youBot_gripperOrientationTarget')
+    local gripperTip2=sim.getObjectHandle('youBot_gripperOrientationTip')
+    Reference_color=sim.getObjectHandle('Vision_sensor')
+    vehicleReference=sim.getObjectHandle('youBot_vehicleReference')
+    vehicleTarget=sim.getObjectHandle('youBot_vehicleTargetPosition')
+    redBox1=sim.getObjectHandle('redRectangle')
+    blueBox1=sim.getObjectHandle('blueRectangle0')
+    yellowBox1=sim.getObjectHandle('greenRectangle')
+    redBox2=sim.getObjectHandle('redRectangle0')
+    blueBox2=sim.getObjectHandle('blueRectangle1')
+    yellowBox2=sim.getObjectHandle('greenRectangle0')
+    inc=1
+    inc1=0
+    out=sim.auxiliaryConsoleOpen("sensor",15,1)
+    armJoints={-1,-1,-1,-1,-1}
+    for i=0,4,1 do
+        armJoints[i+1]=sim.getObjectHandle('youBotArmJoint'..i)
+    end
+    gripper=sim.getObjectHandle('youBot_gripper')
+    place1=sim.getObjectHandle('place1')
+    place2=sim.getObjectHandle('place2')
+    place3=sim.getObjectHandle('place3')
+    place4=sim.getObjectHandle('place4')
+    pickup1={0,-14.52*math.pi/180,-70.27*math.pi/180,-95.27*math.pi/180,0*math.pi/180}
+    pickup2={0,-13.39*math.pi/180,-93.91*math.pi/180,-72.72*math.pi/180,90*math.pi/180}
+    pickup3={0,-14.52*math.pi/180,-57.27*math.pi/180,-95.27*math.pi/180,90*math.pi/180}
+    platformIntermediateDrop={0,16*math.pi/180,52*math.pi/180,73*math.pi/180,0*math.pi/180}
+    platformDrop1={0,54.33*math.pi/180,32.88*math.pi/180,35.76*math.pi/180,0*math.pi/180}--{0,-0.4,0.2}
+    platformDrop2={0,40.74*math.pi/180,45.81*math.pi/180,59.24*math.pi/180,0*math.pi/180}--{0,-0.32,0.2}
+    platformDrop3={0,28.47*math.pi/180,55.09*math.pi/180,78.32*math.pi/180,0*math.pi/180}--{0,-0.24,0.2}
+
+    dist1=0.2
+    dist2=0.2
+    dropHeight1=0.035
+    dropHeight2=0.2
+    dropHeight3=0.4
+    ikSpeed={0.2}
+    ikAccel={0.1}
+    ikJerk={0.1}
+    fkSpeed={1,1,1,1,1}
+    fkAccel={0.6,0.6,0.6,0.6,0.6}
+    fkJerk={1,1,1,1,1}
+    ikMetric={1,1,1,0.1}
+    
+    --if(resultsA and resultsB)then--only do this if the resultsB object actually got returned
+      --  return resultsB[11],resultsB[12],resultsB[13],resultsB[14],1--11 through 14 get us int,r,g and b averaged across the field of view of the sensor
+    --else    
+
+    ikEnv=simIK.createEnvironment()
+    
+    -- Prepare the ik groups, using the convenience function 'simIK.addIkElementFromScene':
+    ikGroup1=simIK.createIkGroup(ikEnv)
+    simIK.addIkElementFromScene(ikEnv,ikGroup1,base,gripperTip,gripperTarget,simIK.constraint_position)
+
+    ikGroup2=simIK.createIkGroup(ikEnv)
+    simIK.setIkGroupCalculation(ikEnv,ikGroup2,simIK.method_damped_least_squares,0.01,100)
+    simIK.addIkElementFromScene(ikEnv,ikGroup2,base,gripperTip,gripperTarget,simIK.constraint_position)
+    local ikElement,simToIkMap=simIK.addIkElementFromScene(ikEnv,ikGroup2,base2,gripperTip2,gripperTarget2,simIK.constraint_gamma)
+    simIK.setIkElementBase(ikEnv,ikGroup2,ikElement,simToIkMap[base2],simToIkMap[constrBase2])
+
+    ikData={}
+    ikData.ikEnv=ikEnv
+    ikData.ikGroups={ikGroup1,ikGroup2}
+    ikData.target=gripperTarget
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    if(inc==1) then
+    while(inc1<3) do
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]<0.05 and resultB[13]>0.05 and resultB[14]<0.05) then
+    pickupBoxFromPlace(yellowBox1,pickup3)
+    dropToPlatform(platformDrop1)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]<0.05 and resultB[13]<0.05 and resultB[14]>0.05) then
+    pickupBoxFromPlace(blueBox1,pickup3)
+    dropToPlatform(platformDrop2)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]>0.05 and resultB[13]<0.05 and resultB[14]<0.05) then
+    pickupBoxFromPlace(redBox1,pickup3)
+    dropToPlatform(platformDrop3)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    end
+    if(inc1>2) then
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place2)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(yellowBox1,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    --q[3]=q[3]+0.05
+    --sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    --pickupFromPlatformAndReorient(yellowBox1)
+    dropToPlace(place2,0,dropHeight2,pickup3,false)
+    sim.setObjectPosition(vehicleTarget,-1,{8,8,0})
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place3)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(blueBox1,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    q[3]=q[3]+0.05
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    dropToPlace(place3,0,dropHeight2,pickup3,false)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place4)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(redBox1,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    q[3]=q[3]+0.05
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    dropToPlace(place4,0,dropHeight2,pickup3,false)
+    inc=0
+    inc1=0 
+    end
+    end
+    ------------------------------------------------------------------------------------------------------
+    if(inc==0) then
+    while(inc1<3) do
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]<0.05 and resultB[13]>0.05 and resultB[14]<0.05) then
+    pickupBoxFromPlace(yellowBox2,pickup3)
+    dropToPlatform(platformDrop1)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]<0.07 and resultB[13]<0.07 and resultB[14]>0.07) then
+    pickupBoxFromPlace(blueBox2,pickup3)
+    dropToPlatform(platformDrop2)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    resultA,resultB=sim.readVisionSensor(Reference_color)
+    sim.auxiliaryConsolePrint(out,string.format("\n x: %0.2f, y %0.2f,z %0.2f",resultB[12],resultB[13],resultB[14]))
+    if(resultB[12]>0.07 and resultB[13]<0.07 and resultB[14]<0.07) then
+    pickupBoxFromPlace(redBox2,pickup3)
+    dropToPlatform(platformDrop3)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    inc1=inc1+1
+    end
+    end
+    if(inc1>2) then
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place2)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist2,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(yellowBox2,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    --q[3]=q[3]+0.05
+    --sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    --pickupFromPlatformAndReorient(yellowBox1)
+    dropToPlace(place2,0.1,dropHeight2,pickup3,false)
+    sim.setObjectPosition(vehicleTarget,-1,{8,8,0})
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place3)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist2,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(blueBox2,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    q[3]=q[3]+0.05
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    dropToPlace(place3,0.1,dropHeight2,pickup3,false)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    m,angle=getBoxAdjustedMatrixAndFacingAngle(place4)
+    sim.setObjectPosition(vehicleTarget,-1,{m[4]-m[1]*dist1,m[8]-m[5]*dist1,0})
+    sim.setObjectOrientation(vehicleTarget,-1,{0,0,angle})
+    sim.setFloatSignal('cameraJoint',-159*math.pi/180)
+    waitToReachVehicleTargetPositionAndOrientation()
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,platformIntermediateDrop,nil,fkcb,armJoints)
+    local q=sim.getObjectPose(redBox2,-1)
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb1,ikData,ikMetric)
+    closeGripper()
+    q[3]=q[3]+0.05
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb2,ikData,ikMetric)
+    dropToPlace(place4,0,dropHeight2,pickup3,false) 
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickup3,nil,fkcb,armJoints)
+    sim.stopSimulation()
+    end
+    end
+end
+function sysCall_cleanup()
+    simIK.eraseEnvironment(ikEnv)
+end
